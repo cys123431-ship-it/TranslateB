@@ -139,6 +139,82 @@ pub fn saved_providers() -> Vec<String> {
     read_auth().keys().cloned().collect()
 }
 
+// ---------- 외부 제공자 (OpenAI 호환 API) ----------
+
+/// OpenCode 설정 파일 (engine/home 안)
+fn config_file() -> std::path::PathBuf {
+    paths::opencode_home().join("config").join("opencode").join("opencode.json")
+}
+
+fn read_config() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(config_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_config(cfg: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let path = config_file();
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, serde_json::to_string_pretty(cfg).unwrap()).map_err(|e| format!("설정을 저장하지 못했습니다: {e}"))
+}
+
+/// OpenAI 호환 API 를 OpenCode 제공자로 등록한다. 키는 같은 이름으로 [API 키] 에 따로 저장한다.
+/// 모델은 "제공자/모델" 이름으로 모델 목록에 나타난다.
+pub fn set_provider(id: &str, base_url: &str, models: &[String]) -> Result<(), String> {
+    let (id, base_url) = (id.trim().trim_end_matches('/'), base_url.trim().trim_end_matches('/'));
+    let models: Vec<&str> = models.iter().map(|m| m.trim()).filter(|m| !m.is_empty()).collect();
+    if id.is_empty() || id.contains('/') || id.contains(' ') {
+        return Err("제공자 이름은 띄어쓰기와 / 없이 넣어 주세요. (예: river)".into());
+    }
+    if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
+        return Err("주소는 https:// 로 시작해야 합니다. (예: https://api.river.ai/v1)".into());
+    }
+    if models.is_empty() {
+        return Err("모델 이름을 하나 이상 넣어 주세요.".into());
+    }
+    let mut model_map = serde_json::Map::new();
+    for m in &models {
+        model_map.insert(m.to_string(), serde_json::json!({ "name": m }));
+    }
+    let mut cfg = read_config();
+    cfg.entry("$schema").or_insert_with(|| serde_json::json!("https://opencode.ai/config.json"));
+    let providers = cfg.entry("provider").or_insert_with(|| serde_json::json!({}));
+    if !providers.is_object() {
+        *providers = serde_json::json!({});
+    }
+    providers.as_object_mut().unwrap().insert(
+        id.to_string(),
+        serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "name": id,
+            "options": { "baseURL": base_url },
+            "models": model_map,
+        }),
+    );
+    write_config(&cfg)
+}
+
+pub fn remove_provider(id: &str) -> Result<(), String> {
+    let mut cfg = read_config();
+    let removed = cfg.get_mut("provider").and_then(|p| p.as_object_mut()).and_then(|p| p.remove(id)).is_some();
+    if removed { write_config(&cfg) } else { Ok(()) }
+}
+
+/// 등록된 외부 제공자: (이름, 주소, 모델들)
+pub fn custom_providers() -> Vec<(String, String, Vec<String>)> {
+    let cfg = read_config();
+    let Some(p) = cfg.get("provider").and_then(|p| p.as_object()) else { return vec![] };
+    p.iter()
+        .map(|(id, v)| {
+            let url = v["options"]["baseURL"].as_str().unwrap_or("").to_string();
+            let models = v["models"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            (id.clone(), url, models)
+        })
+        .collect()
+}
+
 /// OpenCode 자체 로그인/로그아웃 화면을 새 콘솔 창으로 연다. 비밀번호는 이 프로그램을 거치지 않는다.
 pub fn open_console(args: &[&str]) -> Result<(), String> {
     // 경로에 공백이 있어도 되도록 engine 폴더에서 상대 경로로 실행한다.
@@ -164,7 +240,8 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     let mut cmd = base();
     // --print-logs: 무료 한도에 걸리면 OpenCode 는 끝나지 않고 몇 시간 뒤 재시도를 기다린다.
     // 그때 stdout 에는 아무것도 없고 로그(stderr)에만 오류가 찍히므로 로그를 지켜본다.
-    cmd.args(["run", "--pure", "--print-logs", "--model", model, "--format", "json", "--title", title, message])
+    // --pure 는 쓰지 않는다: 외부 제공자(River 등)를 불러오지 못하고 멈춘다.
+    cmd.args(["run", "--print-logs", "--model", model, "--format", "json", "--title", title, message])
         .current_dir(&work)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -180,8 +257,10 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
         s
     });
     let limited = Arc::new(AtomicBool::new(false));
+    let auth_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_t = {
         let limited = limited.clone();
+        let auth_err = auth_err.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
             // 로그가 길 수 있어 오류 줄만 모은다
@@ -189,6 +268,9 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
             for line in std::io::BufReader::new(se).lines().map_while(Result::ok) {
                 if is_limit_line(&line) {
                     limited.store(true, Ordering::Relaxed);
+                }
+                if let Some(kind) = auth_problem(&line) {
+                    *auth_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(kind.to_string());
                 }
                 if line.contains("ERROR") && errors.len() < 8000 {
                     errors.push_str(&line);
@@ -208,6 +290,11 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!("{FREE_LIMIT}0"));
+        }
+        if let Some(kind) = auth_err.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{AUTH_ERROR}{kind}"));
         }
         if stop.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -229,6 +316,9 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     if limited.load(Ordering::Relaxed) {
         return Err(format!("{FREE_LIMIT}0"));
     }
+    if let Some(kind) = auth_err.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Err(format!("{AUTH_ERROR}{kind}"));
+    }
     let text = parse_events(&stdout);
     if text.trim().is_empty() {
         let msg = strip_ansi(&format!("{stderr}\n{stdout}"));
@@ -241,6 +331,24 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
 
 /// 무료 사용 한도 초과 오류의 머리말. 뒤에 한도가 풀리기까지 남은 밀리초가 붙는다.
 pub const FREE_LIMIT: &str = "FREE_LIMIT:";
+
+/// 키·잔액 문제 오류의 머리말. 뒤에 사람이 읽을 이유가 붙는다. 다시 시도해도 소용없다.
+pub const AUTH_ERROR: &str = "AUTH_ERROR:";
+
+/// OpenCode 오류 로그 줄이 키가 틀렸거나 잔액이 없는 경우인지
+pub fn auth_problem(line: &str) -> Option<&'static str> {
+    if !line.contains("ERROR") {
+        return None;
+    }
+    let l = line.to_lowercase();
+    if ["invalid api key", "incorrect api key", "invalid_api_key", "unauthorized", "authentication failed", "api key not found"].iter().any(|p| l.contains(p)) {
+        Some("API 키가 잘못됐습니다")
+    } else if ["payment required", "insufficient balance", "insufficient_quota", "insufficient credit", "insufficient funds"].iter().any(|p| l.contains(p)) {
+        Some("잔액(크레딧)이 부족합니다")
+    } else {
+        None
+    }
+}
 
 /// OpenCode 로그 줄이 무료 한도 초과 오류인지
 pub fn is_limit_line(line: &str) -> bool {
@@ -309,6 +417,37 @@ not json
     }
 
     #[test]
+    fn registers_and_removes_provider() {
+        let _g = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("translateb_prov_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        unsafe { std::env::set_var("TRANSLATEB_HOME", &home) };
+        super::set_provider("river", "https://api.river.ai/v1/", &["deepseek-ai/DeepSeek-V4.1-Flash".into(), " ".into()]).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(super::config_file()).unwrap()).unwrap();
+        let p = &cfg["provider"]["river"];
+        assert_eq!(p["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(p["options"]["baseURL"], "https://api.river.ai/v1");
+        assert!(p["models"]["deepseek-ai/DeepSeek-V4.1-Flash"].is_object());
+        assert_eq!(super::custom_providers().len(), 1);
+        assert!(super::set_provider("ri ver", "https://x", &["m".into()]).is_err());
+        assert!(super::set_provider("river", "api.river.ai", &["m".into()]).is_err());
+        assert!(super::set_provider("river", "https://x", &[]).is_err());
+        super::remove_provider("river").unwrap();
+        assert!(super::custom_providers().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn detects_auth_problems() {
+        let bad_key = r#"timestamp=x level=ERROR message=process error="Invalid API key" stack="AI_APICallError: Invalid API key"#;
+        assert_eq!(super::auth_problem(bad_key), Some("API 키가 잘못됐습니다"));
+        assert_eq!(super::auth_problem("level=ERROR message=x error=\"Payment Required\""), Some("잔액(크레딧)이 부족합니다"));
+        // 오류 줄이 아니면 무시, 메시지 id 에 401 같은 숫자가 있어도 무시
+        assert_eq!(super::auth_problem("level=INFO message=\"Invalid API key\""), None);
+        assert_eq!(super::auth_problem("level=ERROR messageID=msg_1401abc stream error"), None);
+    }
+
+    #[test]
     fn detects_free_limit() {
         let s = r#"{"type":"error","error":{"type":"provider.free-limit","retryAfterMs":54534000}}"#;
         assert_eq!(super::free_limit(s), Some(54534000));
@@ -322,6 +461,16 @@ not json
 /// TRANSLATEB_HOME=<엔진이 있는 폴더> cargo test real_limit -- --ignored
 #[cfg(test)]
 mod live_tests {
+    #[test]
+    #[ignore]
+    fn real_bad_key_is_detected_quickly() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = std::time::Instant::now();
+        let r = super::ask("river/deepseek-ai/DeepSeek-V4.1-Flash", "Reply with exactly: OK", "TranslateB 키 확인", &stop);
+        println!("{:?} after {:?}", r, start.elapsed());
+        assert!(r.unwrap_err().starts_with(super::AUTH_ERROR));
+    }
+
     #[test]
     #[ignore]
     fn real_limit_is_detected_quickly() {

@@ -92,6 +92,9 @@ struct App {
     auth: String,
     key_provider: String,
     key_input: String,
+    prov_id: String,
+    prov_url: String,
+    prov_models: String,
     busy: Option<String>,
     download: f32,
     notice: Option<String>,
@@ -143,6 +146,9 @@ impl App {
             auth: String::new(),
             key_provider: "opencode".into(),
             key_input: String::new(),
+            prov_id: String::new(),
+            prov_url: String::new(),
+            prov_models: String::new(),
             busy: None,
             download: 0.0,
             notice: None,
@@ -282,7 +288,9 @@ impl App {
                 self.busy = None;
                 self.test = Some(r.map_err(|e| {
                     if e.starts_with(engine::FREE_LIMIT) {
-                        format!("{} 무료 사용 한도에 걸렸습니다. 다른 무료 모델을 고르거나 나중에 다시 해 보세요.", self.settings.model)
+                        format!("{} 무료 사용 한도에 걸렸습니다. 무료 모델은 한도를 함께 쓰므로 나중에 다시 하거나 외부 제공자 모델을 쓰세요.", self.settings.model)
+                    } else if let Some(why) = e.strip_prefix(engine::AUTH_ERROR) {
+                        format!("{why}. 제공자 이름과 키를 확인해 주세요.")
                     } else {
                         e
                     }
@@ -463,6 +471,53 @@ impl App {
                 if ui.small_button("새로고침").clicked() {
                     self.bg(|| Msg::Auth(engine::auth_list()));
                 }
+            });
+            ui.end_row();
+
+            // 외부 제공자 (OpenAI 호환 API) 등록
+            ui.label("외부 제공자").on_hover_text("OpenAI 와 같은 형식의 API 를 쓰는 곳(River 등)을 등록합니다. 키는 아래 [API 키] 에 같은 이름으로 저장하세요.");
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.prov_id).hint_text("이름 (예: river)").desired_width(80.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.prov_url).hint_text("주소 (https://…/v1)").desired_width(200.0));
+                });
+                ui.add(egui::TextEdit::singleline(&mut self.prov_models).hint_text("모델 이름 (여러 개면 쉼표로)").desired_width(288.0));
+            });
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("River 값 채우기").clicked() {
+                        self.prov_id = "river".into();
+                        self.prov_url = "https://api.river.ai/v1".into();
+                        self.prov_models = "deepseek-ai/DeepSeek-V4.1-Flash, deepseek-ai/DeepSeek-V4.1-Flash-1017".into();
+                        self.key_provider = "river".into();
+                    }
+                    if ui.button("등록").clicked() {
+                        let models: Vec<String> = self.prov_models.split(',').map(String::from).collect();
+                        self.notice = Some(match engine::set_provider(&self.prov_id, &self.prov_url, &models) {
+                            Ok(()) => {
+                                self.key_provider = self.prov_id.trim().to_string();
+                                format!("{} 을(를) 등록했습니다. 아래 [API 키] 에 {} 키를 저장한 뒤 [사용할 모델] 에서 {}/… 모델을 고르세요.", self.prov_id.trim(), self.prov_id.trim(), self.prov_id.trim())
+                            }
+                            Err(e) => e,
+                        });
+                        self.bg(|| Msg::Models(engine::models()));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (id, url, models) in engine::custom_providers() {
+                        if ui
+                            .small_button(format!("{id} 삭제"))
+                            .on_hover_text(format!("{url}\n{}", models.join("\n")))
+                            .clicked()
+                        {
+                            self.notice = Some(match engine::remove_provider(&id) {
+                                Ok(()) => format!("{id} 등록을 지웠습니다. 키는 [API 키] 에서 따로 지우세요."),
+                                Err(e) => e,
+                            });
+                            self.bg(|| Msg::Models(engine::models()));
+                        }
+                    }
+                });
             });
             ui.end_row();
 
