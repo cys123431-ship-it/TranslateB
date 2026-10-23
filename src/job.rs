@@ -145,6 +145,100 @@ pub fn prepare(name: &str, source: &Path, chapters: &[Chapter], rules: &str) -> 
     Ok(job)
 }
 
+/// 다른 도구로 하던 작업 폴더를 가져온다. `원문_조각/NN/001.txt` 구조만 있으면 되고,
+/// `번역_조각/NN/*.md`(끝난 조각), `번역/*.md`, 목차(`단원목차.md`/`목차.md`),
+/// 규칙(`tools/rules.md`/`rules.md`)이 있으면 함께 가져온다. 원래 폴더는 건드리지 않는다.
+/// 돌려주는 값: (작업, 가져온 규칙 파일 이름)
+pub fn import(from: &Path, fallback_rules: &str) -> Result<(Job, String), String> {
+    let src_root = from.join("원문_조각");
+    let mut nums: Vec<String> = std::fs::read_dir(&src_root)
+        .map_err(|_| "이 폴더에는 원문_조각 폴더가 없습니다. 가져올 수 있는 작업 폴더가 아닙니다.".to_string())?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    nums.sort_by_key(|n| n.parse::<u32>().unwrap_or(0));
+    if nums.is_empty() {
+        return Err("원문_조각 안에 단원 폴더(01, 02 …)가 없습니다.".into());
+    }
+
+    let toc_path = ["목차.md", "단원목차.md"].iter().map(|n| from.join(n)).find(|p| p.exists());
+    let toc = toc_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let title_re = regex::Regex::new(r"^##\s*0*(\d+)\s*(?:단원|\.)?\s*(?:—|-|:)?\s*(.+?)\s*(?:\(.*)?$").unwrap();
+    let titles: BTreeMap<u32, String> = toc
+        .lines()
+        .filter_map(|l| title_re.captures(l))
+        .filter_map(|c| Some((c[1].parse().ok()?, c[2].trim().trim_end_matches(['—', '-']).trim().to_string())))
+        .collect();
+
+    // 규칙: 원래 작업의 규칙을 rules 폴더로 복사해 그대로 쓴다
+    let name = from.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "가져온 작업".into());
+    let rules = match ["tools/rules.md", "rules.md"].iter().map(|n| from.join(n)).find(|p| p.exists()) {
+        Some(p) => {
+            let mut body = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+            if body.contains("코드 규칙") && !body.contains("<!-- code-check -->") {
+                body = format!("<!-- code-check -->\n{body}");
+            }
+            let file = format!("가져옴_{name}.md");
+            std::fs::create_dir_all(paths::rules_dir()).map_err(|e| e.to_string())?;
+            std::fs::write(paths::rules_dir().join(&file), body).map_err(|e| e.to_string())?;
+            file
+        }
+        None => fallback_rules.to_string(),
+    };
+
+    let dir = unique_dir(&name);
+    let job = Job::open(dir.clone());
+    let mut st = State { source: from.display().to_string(), code_check: rules_code_check(&rules), rules, ..Default::default() };
+    let copy_ext = |a: &Path, b: &Path, ext: &str| -> Result<usize, String> {
+        let mut n = 0;
+        let Ok(rd) = std::fs::read_dir(a) else { return Ok(0) };
+        std::fs::create_dir_all(b).map_err(|e| e.to_string())?;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == ext) {
+                std::fs::copy(&p, b.join(e.file_name())).map_err(|e| e.to_string())?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    };
+    for (i, old) in nums.iter().enumerate() {
+        let num = format!("{:02}", i + 1);
+        let chunks = copy_ext(&src_root.join(old), &job.src(&num), "txt")?;
+        copy_ext(&from.join("번역_조각").join(old), &job.parts(&num), "md")?;
+        for k in 1..=chunks {
+            if job.parts(&num).join(format!("{k:03}.md")).exists() {
+                st.chunk_models.insert(format!("{num}/{k:03}"), "이전 작업".into());
+            }
+        }
+        let n: u32 = old.parse().unwrap_or(0);
+        let title = titles.get(&n).cloned().unwrap_or_else(|| format!("{n}단원"));
+        st.chapters.push(ChapterInfo { num, title, chunks });
+    }
+    copy_ext(&from.join("번역"), &dir.join("번역"), "md")?;
+    std::fs::create_dir_all(dir.join("번역")).map_err(|e| e.to_string())?;
+    match &toc_path {
+        Some(p) => {
+            std::fs::copy(p, dir.join("목차.md")).map_err(|e| e.to_string())?;
+        }
+        None => {
+            let mut t = String::from("# 원문 목차\n\n");
+            for c in &st.chapters {
+                t.push_str(&format!("## {}. {} — {}조각\n", c.num, c.title, c.chunks));
+            }
+            std::fs::write(dir.join("목차.md"), t).map_err(|e| e.to_string())?;
+        }
+    }
+    job.save(&st)?;
+    for c in &st.chapters {
+        merge(&job, c)?;
+    }
+    report(&job)?;
+    Ok((job, st.rules.clone()))
+}
+
 pub fn rules_code_check(rules: &str) -> bool {
     std::fs::read_to_string(paths::rules_dir().join(rules)).map(|s| s.contains("<!-- code-check -->")).unwrap_or(false)
 }
@@ -375,18 +469,28 @@ pub fn list_jobs() -> Vec<Job> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    /// 가짜 엔진으로 준비 → 번역 → 합치기 → 보고서 → 이어하기까지 한 번에 확인한다.
-    #[test]
-    fn mock_pipeline_end_to_end() {
-        let home = std::env::temp_dir().join(format!("translateb_test_{}", std::process::id()));
+    /// 테스트들이 TRANSLATEB_HOME 환경변수를 바꾸므로 한 번에 하나씩 돈다
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn use_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("translateb_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("rules")).unwrap();
-        std::fs::write(home.join("rules/test.md"), "<!-- code-check -->\n규칙\npointer=포인터, array=배열\n").unwrap();
         unsafe {
             std::env::set_var("TRANSLATEB_HOME", &home);
             std::env::set_var("TRANSLATEB_MOCK", "1");
         }
+        home
+    }
+
+    /// 가짜 엔진으로 준비 → 번역 → 합치기 → 보고서 → 이어하기까지 한 번에 확인한다.
+    #[test]
+    fn mock_pipeline_end_to_end() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = use_home("pipeline");
+        std::fs::write(home.join("rules/test.md"), "<!-- code-check -->\n규칙\npointer=포인터, array=배열\n").unwrap();
 
         let mut lines = Vec::new();
         for i in 0..300 {
@@ -425,6 +529,38 @@ mod tests {
         let translated = rx.try_iter().filter(|e| matches!(e, Event::Progress { .. })).count();
         assert_eq!(translated, 1);
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 다른 도구로 하던 작업 폴더를 가져오면 끝난 조각은 그대로, 남은 조각만 번역 대상이 된다.
+    #[test]
+    fn imports_legacy_folder() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = use_home("import");
+        let old = home.join("옛작업");
+        for (ch, n, done) in [("01", 3, 3), ("02", 2, 1)] {
+            std::fs::create_dir_all(old.join("원문_조각").join(ch)).unwrap();
+            std::fs::create_dir_all(old.join("번역_조각").join(ch)).unwrap();
+            for k in 1..=n {
+                std::fs::write(old.join(format!("원문_조각/{ch}/{k:03}.txt")), "Sample text.").unwrap();
+            }
+            for k in 1..=done {
+                std::fs::write(old.join(format!("번역_조각/{ch}/{k:03}.md")), "예시 문장.").unwrap();
+            }
+        }
+        std::fs::create_dir_all(old.join("tools")).unwrap();
+        std::fs::write(old.join("tools/rules.md"), "[코드 규칙]\nx=y, a=b\n").unwrap();
+        std::fs::write(old.join("단원목차.md"), "# 목록\n\n## 1단원 — First Part (PDF 1~2쪽)\n- s\n\n## 2단원 — Second Part (PDF 1~3쪽)\n").unwrap();
+        let (job, rules) = import(&old, "프로그래밍.md").unwrap();
+        assert!(job.dir.starts_with(home.join("작업")));
+        let st = job.state().unwrap();
+        assert_eq!(rules, "가져옴_옛작업.md");
+        assert!(st.code_check);
+        assert_eq!(st.chapters.iter().map(|c| (c.title.as_str(), c.chunks)).collect::<Vec<_>>(), vec![("First Part", 3), ("Second Part", 2)]);
+        assert_eq!(job.progress(&st), (4, 5));
+        assert!(job.dir.join("번역/01.md").exists());
+        assert!(!job.dir.join("번역/02.md").exists());
+        assert!(old.join("원문_조각/01/001.txt").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

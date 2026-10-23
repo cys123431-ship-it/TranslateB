@@ -31,6 +31,17 @@ fn main() {
             step("OpenCode", update::latest_opencode().and_then(|l| update::install_opencode(&l, &|_| {})));
             step("PDFium", update::install_pdfium(&|_| {}));
         }
+        // 기존 작업 폴더 가져오기 (화면의 [기존 작업 가져오기] 와 같음)
+        Some("--import") if args.len() == 3 => match job::import(std::path::Path::new(&args[2]), "프로그래밍.md") {
+            Ok((j, rules)) => {
+                let (d, t) = j.state().map(|s| j.progress(&s)).unwrap_or((0, 0));
+                println!("{} 가져옴: {d}/{t}조각 끝남, 규칙 {rules}", j.dir.display());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
         _ => app::run(),
     }
 }

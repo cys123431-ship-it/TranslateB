@@ -562,7 +562,25 @@ impl App {
     }
 
     fn ui_jobs(&mut self, ui: &mut egui::Ui) {
-        ui.heading("작업 목록");
+        ui.horizontal(|ui| {
+            ui.heading("작업 목록");
+            if ui
+                .button("기존 작업 가져오기…")
+                .on_hover_text("다른 도구로 하던 작업 폴더(원문_조각 폴더가 있는 곳)를 가져와서 이어서 합니다. 원래 폴더는 그대로 둡니다.")
+                .clicked()
+            {
+                if let Some(dir) = rfd::FileDialog::new().set_title("가져올 작업 폴더 선택").pick_folder() {
+                    self.notice = Some(match job::import(&dir, &self.settings.rules) {
+                        Ok((j, rules)) => {
+                            self.rules_list = list_rules();
+                            let (d, t) = j.state().map(|s| j.progress(&s)).unwrap_or((0, 0));
+                            format!("{} 을(를) 가져왔습니다: {d}/{t}조각 끝남, 규칙 {rules}. [이어하기] 로 남은 조각을 번역합니다.", j.name())
+                        }
+                        Err(e) => format!("가져오지 못했습니다: {e}"),
+                    });
+                }
+            }
+        });
         if let Some(run) = &self.running {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong(format!("진행 중: {}", run.name));
