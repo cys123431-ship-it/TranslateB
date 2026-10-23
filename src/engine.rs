@@ -161,6 +161,9 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     }
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
+    if let Some(ms) = free_limit(&stdout) {
+        return Err(format!("{FREE_LIMIT}{ms}"));
+    }
     let text = parse_events(&stdout);
     if text.trim().is_empty() {
         let msg = strip_ansi(&format!("{stderr}\n{stdout}"));
@@ -169,6 +172,18 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
         return Err(if tail.is_empty() { "빈 응답".into() } else { tail });
     }
     Ok(text.trim().to_string())
+}
+
+/// 무료 사용 한도 초과 오류의 머리말. 뒤에 한도가 풀리기까지 남은 밀리초가 붙는다.
+pub const FREE_LIMIT: &str = "FREE_LIMIT:";
+
+/// 무료 사용 한도에 걸렸으면 풀리기까지 남은 밀리초 (모르면 0)
+pub fn free_limit(stdout: &str) -> Option<u64> {
+    stdout.lines().find_map(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let kind = v["error"]["type"].as_str()?;
+        (v["type"] == "error" && kind.contains("free-limit")).then(|| v["error"]["retryAfterMs"].as_u64().unwrap_or(0))
+    })
 }
 
 /// `--format json` 출력에서 text 조각만 이어 붙인다.
@@ -204,5 +219,12 @@ mod tests {
 not json
 {"type":"text","part":{"text":" OK"}}"#;
         assert_eq!(super::parse_events(s), "안녕 OK");
+    }
+
+    #[test]
+    fn detects_free_limit() {
+        let s = r#"{"type":"error","error":{"type":"provider.free-limit","retryAfterMs":54534000}}"#;
+        assert_eq!(super::free_limit(s), Some(54534000));
+        assert_eq!(super::free_limit(r#"{"type":"text","part":{"text":"x"}}"#), None);
     }
 }

@@ -182,6 +182,8 @@ pub fn run(job: &Job, opt: &RunOptions, tx: &Sender<Event>) -> Result<(), String
 
     let chapters = st.chapters.clone();
     let (mut done, total) = job.progress(&st);
+    // 무료 사용 한도에 걸리면 다시 시도해도 소용없으므로 전체를 멈춘다
+    let mut limit: Option<u64> = None;
     'outer: for ch in &chapters {
         let part_dir = job.parts(&ch.num);
         std::fs::create_dir_all(&part_dir).map_err(|e| e.to_string())?;
@@ -217,6 +219,10 @@ pub fn run(job: &Job, opt: &RunOptions, tx: &Sender<Event>) -> Result<(), String
                         Some(r) => reason = r,
                     },
                     Err(e) if e == "중지됨" => break 'outer,
+                    Err(e) if e.starts_with(engine::FREE_LIMIT) => {
+                        limit = Some(e[engine::FREE_LIMIT.len()..].parse().unwrap_or(0));
+                        break 'outer;
+                    }
                     Err(e) => reason = format!("오류: {e}"),
                 }
                 if attempt == TRIES {
@@ -252,7 +258,15 @@ pub fn run(job: &Job, opt: &RunOptions, tx: &Sender<Event>) -> Result<(), String
     }
     report(job)?;
     let (d, t) = job.progress(&st);
-    let msg = if opt.stop.load(Ordering::Relaxed) {
+    let msg = if let Some(ms) = limit {
+        let when = if ms > 0 {
+            let m = ms / 60_000;
+            format!("약 {}시간 {}분 뒤에 풀립니다", m / 60, m % 60)
+        } else {
+            "풀리는 시각은 알 수 없습니다".into()
+        };
+        format!("{} 무료 사용 한도에 걸려 멈췄습니다 ({d}/{t}조각). {when}. 그때 [이어하기] 를 누르거나, 다른 무료 모델을 골라 바로 이어서 할 수 있습니다.", opt.model)
+    } else if opt.stop.load(Ordering::Relaxed) {
         format!("중지됨 ({d}/{t}조각). 다시 시작하면 이어서 합니다.")
     } else if d == t {
         "검토 준비 완료".to_string()
