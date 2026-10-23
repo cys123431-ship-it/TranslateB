@@ -1,10 +1,10 @@
 [package]
 name = "translateb"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
 pdfium-render = "0.9"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"

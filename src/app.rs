@@ -421,6 +421,12 @@ impl App {
             }
             ui.end_row();
 
+            // 사용할 모델 (시험·새 번역·이어하기에 모두 쓰임)
+            ui.label("사용할 모델");
+            model_combo(ui, "model_check", &self.models, &mut self.settings.model);
+            ui.label(if self.settings.model.ends_with("-free") { "무료 모델" } else { "유료일 수 있음" });
+            ui.end_row();
+
             // 시험 번역
             ui.label("시험 번역");
             match &self.test {
@@ -549,7 +555,7 @@ impl App {
                 }
             });
             ui.label("모델");
-            model_combo(ui, &self.models, &mut self.settings.model);
+            model_combo(ui, "model_new", &self.models, &mut self.settings.model);
         });
         ui.horizontal(|ui| {
             ui.label("조각 사이 쉬는 시간");
@@ -651,7 +657,7 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("이어서 할 때 쓸 모델");
-            model_combo(ui, &self.models, &mut self.settings.model);
+            model_combo(ui, "model_jobs", &self.models, &mut self.settings.model);
         });
         ui.separator();
 
@@ -755,8 +761,9 @@ impl eframe::App for App {
     }
 }
 
-fn model_combo(ui: &mut egui::Ui, models: &[String], model: &mut String) {
-    egui::ComboBox::from_id_salt(ui.next_auto_id()).selected_text(model.clone()).width(280.0).show_ui(ui, |ui| {
+/// id 는 화면마다 고정값이어야 한다 (바뀌면 목록을 펼치자마자 닫힌다)
+fn model_combo(ui: &mut egui::Ui, id: &str, models: &[String], model: &mut String) {
+    egui::ComboBox::from_id_salt(id).selected_text(model.clone()).width(280.0).show_ui(ui, |ui| {
         for m in models {
             ui.selectable_value(model, m.clone(), m);
         }
