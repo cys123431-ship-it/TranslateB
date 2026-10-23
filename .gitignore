@@ -1,0 +1,6 @@
+/target
+/dist
+# 실행할 때 생기는 것들 (엔진, 로그인 정보, 번역 작업, 설정)
+/engine
+/작업
+settings.json
