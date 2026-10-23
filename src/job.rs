@@ -469,11 +469,6 @@ pub fn list_jobs() -> Vec<Job> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// 테스트들이 TRANSLATEB_HOME 환경변수를 바꾸므로 한 번에 하나씩 돈다
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn use_home(name: &str) -> PathBuf {
         let home = std::env::temp_dir().join(format!("translateb_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -488,7 +483,7 @@ mod tests {
     /// 가짜 엔진으로 준비 → 번역 → 합치기 → 보고서 → 이어하기까지 한 번에 확인한다.
     #[test]
     fn mock_pipeline_end_to_end() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = use_home("pipeline");
         std::fs::write(home.join("rules/test.md"), "<!-- code-check -->\n규칙\npointer=포인터, array=배열\n").unwrap();
 
@@ -535,7 +530,7 @@ mod tests {
     /// 다른 도구로 하던 작업 폴더를 가져오면 끝난 조각은 그대로, 남은 조각만 번역 대상이 된다.
     #[test]
     fn imports_legacy_folder() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = use_home("import");
         let old = home.join("옛작업");
         for (ch, n, done) in [("01", 3, 3), ("02", 2, 1)] {

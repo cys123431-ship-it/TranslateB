@@ -99,11 +99,52 @@ pub fn auth_list() -> String {
     output(&["auth", "list"]).map(|s| strip_ansi(&s)).unwrap_or_else(|e| e)
 }
 
+/// OpenCode 가 쓰는 자격 증명 파일 (engine/home 안)
+fn auth_file() -> std::path::PathBuf {
+    paths::opencode_home().join("data").join("opencode").join("auth.json")
+}
+
+fn read_auth() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(auth_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// API 키를 OpenCode 와 같은 형식({"provider": {"type":"api","key":"..."}})으로 저장한다.
+/// 키는 이 프로그램 폴더의 engine/home 안에만 남는다.
+pub fn set_api_key(provider: &str, key: &str) -> Result<(), String> {
+    let (provider, key) = (provider.trim().trim_end_matches('/'), key.trim());
+    if provider.is_empty() || key.is_empty() {
+        return Err("제공자 이름과 API 키를 모두 넣어 주세요.".into());
+    }
+    let mut auth = read_auth();
+    auth.insert(provider.to_string(), serde_json::json!({ "type": "api", "key": key }));
+    let path = auth_file();
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, serde_json::to_string_pretty(&auth).unwrap()).map_err(|e| format!("키를 저장하지 못했습니다: {e}"))
+}
+
+pub fn remove_api_key(provider: &str) -> Result<(), String> {
+    let mut auth = read_auth();
+    if auth.remove(provider).is_none() {
+        return Ok(());
+    }
+    std::fs::write(auth_file(), serde_json::to_string_pretty(&auth).unwrap()).map_err(|e| e.to_string())
+}
+
+/// 키가 저장된 제공자 이름들 (키 값은 돌려주지 않는다)
+pub fn saved_providers() -> Vec<String> {
+    read_auth().keys().cloned().collect()
+}
+
 /// OpenCode 자체 로그인/로그아웃 화면을 새 콘솔 창으로 연다. 비밀번호는 이 프로그램을 거치지 않는다.
 pub fn open_console(args: &[&str]) -> Result<(), String> {
-    // 경로에 공백이 있어도 되도록 engine 폴더에서 상대 이름으로 실행한다
+    // 경로에 공백이 있어도 되도록 engine 폴더에서 상대 경로로 실행한다.
+    // NoDefaultCurrentDirectoryInExePath 가 켜진 PC에서도 찾도록 .\ 를 붙인다.
     let mut cmd = Command::new("cmd");
-    cmd.args(["/c", "start", "OpenCode", "cmd", "/k", "opencode.exe"]).args(args).current_dir(paths::engine_dir());
+    cmd.args(["/c", "start", "OpenCode", "cmd", "/k", r".\opencode.exe"]).args(args).current_dir(paths::engine_dir());
     for (k, v) in base().get_envs() {
         if let Some(v) = v {
             cmd.env(k, v);
@@ -219,6 +260,23 @@ mod tests {
 not json
 {"type":"text","part":{"text":" OK"}}"#;
         assert_eq!(super::parse_events(s), "안녕 OK");
+    }
+
+    #[test]
+    fn saves_and_removes_api_key() {
+        let _g = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("translateb_auth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        unsafe { std::env::set_var("TRANSLATEB_HOME", &home) };
+        super::set_api_key("other", "k1").unwrap();
+        super::set_api_key("opencode/", " test-key ").unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(super::auth_file()).unwrap()).unwrap();
+        assert_eq!(saved["opencode"], serde_json::json!({ "type": "api", "key": "test-key" }));
+        assert_eq!(saved["other"]["key"], "k1");
+        super::remove_api_key("opencode").unwrap();
+        assert_eq!(super::saved_providers(), vec!["other".to_string()]);
+        assert!(super::set_api_key("opencode", "  ").is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

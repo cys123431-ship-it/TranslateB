@@ -90,6 +90,8 @@ struct App {
     models_err: Option<String>,
     test: Option<Result<String, String>>,
     auth: String,
+    key_provider: String,
+    key_input: String,
     busy: Option<String>,
     download: f32,
     notice: Option<String>,
@@ -139,6 +141,8 @@ impl App {
             models_err: None,
             test: None,
             auth: String::new(),
+            key_provider: "opencode".into(),
+            key_input: String::new(),
             busy: None,
             download: 0.0,
             notice: None,
@@ -446,6 +450,37 @@ impl App {
                 }
                 if ui.small_button("새로고침").clicked() {
                     self.bg(|| Msg::Auth(engine::auth_list()));
+                }
+            });
+            ui.end_row();
+
+            // API 키 직접 넣기
+            ui.label("API 키");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.key_provider).desired_width(80.0))
+                    .on_hover_text("제공자 이름. OpenCode Zen 키는 opencode 그대로 두세요.");
+                ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("API 키 붙여넣기").desired_width(200.0));
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.key_input.trim().is_empty(), egui::Button::new("저장")).clicked() {
+                    self.notice = Some(match engine::set_api_key(&self.key_provider, &self.key_input) {
+                        Ok(()) => format!("{} 키를 저장했습니다. [시험하기] 로 확인해 보세요.", self.key_provider.trim()),
+                        Err(e) => e,
+                    });
+                    // 저장한 뒤에는 화면에서 키를 지운다
+                    self.key_input.clear();
+                    self.bg(|| Msg::Auth(engine::auth_list()));
+                    self.bg(|| Msg::Models(engine::models()));
+                }
+                for p in engine::saved_providers() {
+                    if ui.small_button(format!("{p} 키 삭제")).on_hover_text("공용 PC에서는 다 쓴 뒤 지우세요.").clicked() {
+                        self.notice = Some(match engine::remove_api_key(&p) {
+                            Ok(()) => format!("{p} 키를 지웠습니다."),
+                            Err(e) => e,
+                        });
+                        self.bg(|| Msg::Auth(engine::auth_list()));
+                        self.bg(|| Msg::Models(engine::models()));
+                    }
                 }
             });
             ui.end_row();

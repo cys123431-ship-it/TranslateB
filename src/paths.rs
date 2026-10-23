@@ -49,3 +49,7 @@ pub fn host_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".into())
 }
+
+/// 테스트들이 TRANSLATEB_HOME 환경변수를 바꾸므로 한 번에 하나씩 돌게 한다
+#[cfg(test)]
+pub static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
