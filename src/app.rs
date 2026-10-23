@@ -280,7 +280,13 @@ impl App {
             Msg::Models(Err(e)) => self.models_err = Some(e),
             Msg::Test(r) => {
                 self.busy = None;
-                self.test = Some(r);
+                self.test = Some(r.map_err(|e| {
+                    if e.starts_with(engine::FREE_LIMIT) {
+                        format!("{} 무료 사용 한도에 걸렸습니다. 다른 무료 모델을 고르거나 나중에 다시 해 보세요.", self.settings.model)
+                    } else {
+                        e
+                    }
+                }));
             }
             Msg::Installed(what, r) => {
                 self.busy = None;

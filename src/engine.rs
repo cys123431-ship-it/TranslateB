@@ -162,7 +162,9 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let _guard = engine_lock();
     let mut cmd = base();
-    cmd.args(["run", "--pure", "--model", model, "--format", "json", "--title", title, message])
+    // --print-logs: 무료 한도에 걸리면 OpenCode 는 끝나지 않고 몇 시간 뒤 재시도를 기다린다.
+    // 그때 stdout 에는 아무것도 없고 로그(stderr)에만 오류가 찍히므로 로그를 지켜본다.
+    cmd.args(["run", "--pure", "--print-logs", "--model", model, "--format", "json", "--title", title, message])
         .current_dir(&work)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -171,22 +173,41 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     let mut child = cmd.spawn().map_err(|e| format!("OpenCode 를 실행하지 못했습니다: {e}"))?;
 
     let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
+    let se = child.stderr.take().unwrap();
     let out_t = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = so.read_to_string(&mut s);
         s
     });
-    let err_t = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = se.read_to_string(&mut s);
-        s
-    });
+    let limited = Arc::new(AtomicBool::new(false));
+    let err_t = {
+        let limited = limited.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            // 로그가 길 수 있어 오류 줄만 모은다
+            let mut errors = String::new();
+            for line in std::io::BufReader::new(se).lines().map_while(Result::ok) {
+                if is_limit_line(&line) {
+                    limited.store(true, Ordering::Relaxed);
+                }
+                if line.contains("ERROR") && errors.len() < 8000 {
+                    errors.push_str(&line);
+                    errors.push('\n');
+                }
+            }
+            errors
+        })
+    };
 
     let start = Instant::now();
     loop {
         if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             break;
+        }
+        if limited.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{FREE_LIMIT}0"));
         }
         if stop.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -205,6 +226,9 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
     if let Some(ms) = free_limit(&stdout) {
         return Err(format!("{FREE_LIMIT}{ms}"));
     }
+    if limited.load(Ordering::Relaxed) {
+        return Err(format!("{FREE_LIMIT}0"));
+    }
     let text = parse_events(&stdout);
     if text.trim().is_empty() {
         let msg = strip_ansi(&format!("{stderr}\n{stdout}"));
@@ -217,6 +241,11 @@ pub fn ask(model: &str, message: &str, title: &str, stop: &Arc<AtomicBool>) -> R
 
 /// 무료 사용 한도 초과 오류의 머리말. 뒤에 한도가 풀리기까지 남은 밀리초가 붙는다.
 pub const FREE_LIMIT: &str = "FREE_LIMIT:";
+
+/// OpenCode 로그 줄이 무료 한도 초과 오류인지
+pub fn is_limit_line(line: &str) -> bool {
+    line.contains("Free usage limit") || line.contains("FreeUsageLimit") || line.contains("free-limit")
+}
 
 /// 무료 사용 한도에 걸렸으면 풀리기까지 남은 밀리초 (모르면 0)
 pub fn free_limit(stdout: &str) -> Option<u64> {
@@ -284,5 +313,22 @@ not json
         let s = r#"{"type":"error","error":{"type":"provider.free-limit","retryAfterMs":54534000}}"#;
         assert_eq!(super::free_limit(s), Some(54534000));
         assert_eq!(super::free_limit(r#"{"type":"text","part":{"text":"x"}}"#), None);
+        assert!(super::is_limit_line(r#"level=ERROR message="stream error" error.error="AI_APICallError: Free usage limit reached. Subscribe""#));
+        assert!(!super::is_limit_line("level=INFO message=stream"));
+    }
+}
+
+/// 실제 엔진으로 한도 감지를 확인한다 (무료 한도에 걸린 상태에서만 의미 있음).
+/// TRANSLATEB_HOME=<엔진이 있는 폴더> cargo test real_limit -- --ignored
+#[cfg(test)]
+mod live_tests {
+    #[test]
+    #[ignore]
+    fn real_limit_is_detected_quickly() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = std::time::Instant::now();
+        let r = super::ask("opencode/deepseek-v4.1-flash-free", "Reply with exactly: OK", "TranslateB 한도 확인", &stop);
+        println!("{:?} after {:?}", r, start.elapsed());
+        assert!(start.elapsed() < std::time::Duration::from_secs(120));
     }
 }
